@@ -1,4 +1,4 @@
-module github.com/northernside/http-ktls
+module github.com/northernside/ktls
 
 go 1.26.1
 
