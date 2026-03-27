@@ -121,6 +121,10 @@ Implements `net.Listener`. Pass it to `http.Serve`, `http.Server.Serve`, or anyt
 
 Returns true if the kernel supports kTLS. Tries to set `TCP_ULP` on a throwaway socket.
 
+## HTTP/3
+
+HTTP/3 is not supported. kTLS hooks into the TCP stack via `TCP_ULP`, but HTTP/3 runs over QUIC (UDP), so kernel TLS offloading cannot apply.
+
 ## Non-linux platforms
 
 Everything compiles on all platforms. `Available()` returns false, and connections always use userspace TLS.
