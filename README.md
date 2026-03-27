@@ -1,4 +1,4 @@
-# go-ktls
+# kTLS
 
 A Go library that offloads TLS encryption to the Linux kernel. It wraps `net.Listener` so you can use it with `net/http` (or anything that accepts a `net.Listener`) without changing your application code.
 
@@ -35,7 +35,7 @@ import (
     "net"
     "net/http"
 
-    ktls "github.com/northernside/http-ktls"
+    ktls "github.com/northernside/ktls"
 )
 
 func main() {
