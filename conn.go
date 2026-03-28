@@ -3,6 +3,7 @@ package ktls
 import (
 	"crypto/tls"
 	"net"
+	"syscall"
 )
 
 // Post handshake connection, reads and writes hit kTLS
@@ -55,6 +56,16 @@ func (c *conn) handleKeyUpdate() error {
 
 	c.rxSecret = next
 	return nil
+}
+
+// Implements syscall.Conn so that callers (e.g. zerocopy splice) can extract the raw file descriptor from the underlying TCP connection
+func (c *conn) SyscallConn() (syscall.RawConn, error) {
+	sc, ok := c.Conn.(syscall.Conn)
+	if !ok {
+		return nil, net.ErrClosed
+	}
+
+	return sc.SyscallConn()
 }
 
 // ConnectionState allows net/http to populate Request.TLS, else it would think we're using plaintext
