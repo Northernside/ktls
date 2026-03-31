@@ -6,6 +6,16 @@ import (
 	"syscall"
 )
 
+// implemented by a connection returned from Listener.Accept when kTLS was successfully enabled
+// type-assert net.Conn to this interface to distinguish kTLS-active connections from plain *tls.Conn fallbacks
+type Conn interface {
+	net.Conn
+	syscall.Conn
+
+	ConnectionState() tls.ConnectionState
+	DidResume() bool
+}
+
 // Post handshake connection, reads and writes hit kTLS
 type conn struct {
 	net.Conn
@@ -71,4 +81,9 @@ func (c *conn) SyscallConn() (syscall.RawConn, error) {
 // ConnectionState allows net/http to populate Request.TLS, else it would think we're using plaintext
 func (c *conn) ConnectionState() tls.ConnectionState {
 	return c.state
+}
+
+// equivalent to ConnectionState().DidResume (was established via TLS session resumption (psk / session tickets))
+func (c *conn) DidResume() bool {
+	return c.state.DidResume
 }

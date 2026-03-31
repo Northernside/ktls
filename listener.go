@@ -27,9 +27,13 @@ func (l *Listener) Accept() (net.Conn, error) {
 
 	counter := &recordCounter{Conn: rawConn}
 	keyBuf := &keyLogBuffer{}
-	l.TLSConfig.KeyLogWriter = keyBuf // overwrite keylogwriter for us to capture secrets
 
-	tlsConn := tls.Server(counter, l.TLSConfig)
+	// clone per-connection so we can set a per-connection KeyLogWriter
+	// without racing against other concurrent Accept() calls
+	cfg := l.TLSConfig.Clone()
+	cfg.KeyLogWriter = keyBuf
+
+	tlsConn := tls.Server(counter, cfg)
 	if err := tlsConn.Handshake(); err != nil {
 		rawConn.Close()
 		return nil, err
