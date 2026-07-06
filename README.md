@@ -6,7 +6,7 @@ The TLS handshake still happens in userspace via `crypto/tls`. After the handsha
 
 If kTLS setup fails for any reason (unsupported kernel, unsupported cipher, missing module), the connection silently falls back to regular userspace TLS. Your server keeps working either way.
 
-Only TLS 1.3 connections get offloaded. TLS 1.2 connections work fine but stay in userspace (working on adding support for kTLS 1.2).
+Both TLS 1.3 and TLS 1.2 are offloaded, across every AEAD cipher suite they define (AES-GCM and ChaCha20-Poly1305). Legacy CBC suites can't be offloaded by kTLS (general kTLS constraint) and stay in userspace.
 
 See the [kernel TLS docs](https://docs.kernel.org/networking/tls.html) for background on how kTLS works at the kernel level.
 
@@ -14,7 +14,7 @@ See the [kernel TLS docs](https://docs.kernel.org/networking/tls.html) for backg
 
 - Linux with the `tls` kernel module loaded (`modprobe tls`)
 - Go 1.24+
-- TLS 1.3, or TLS 1.2 with an AES-GCM cipher suite
+- TLS 1.3 or TLS 1.2 with an AEAD cipher suite (AES-GCM or ChaCha20-Poly1305)
 
 You can also check at runtime:
 
@@ -96,18 +96,21 @@ TLS 1.2 has no KeyUpdate. Renegotiation is not supported (the connection is clos
 
 ## Supported ciphers
 
-**TLS 1.3** - all three suites (the only ones defined by RFC 8446):
+The kernel's `crypto_info` interface covers AES-GCM, ChaCha20-Poly1305, and AES-CCM, and nothing else. Every AEAD suite that TLS 1.3 and TLS 1.2 define is offloaded here:
+
+**TLS 1.3** - all three suites (the only ones RFC 8446 defines):
 
 - `TLS_AES_128_GCM_SHA256` (0x1301)
 - `TLS_AES_256_GCM_SHA384` (0x1302)
 - `TLS_CHACHA20_POLY1305_SHA256` (0x1303)
 
-**TLS 1.2** - the AES-GCM suites:
+**TLS 1.2** - every AEAD suite. The key exchange (ECDHE / RSA) is irrelevant to the offload, so all variants of a given cipher are covered:
 
-- `TLS_ECDHE_{RSA,ECDSA}_WITH_AES_128_GCM_SHA256` (0xC02F / 0xC02B)
-- `TLS_ECDHE_{RSA,ECDSA}_WITH_AES_256_GCM_SHA384` (0xC030 / 0xC02C)
+- `TLS_{ECDHE_ECDSA,ECDHE_RSA,RSA}_WITH_AES_128_GCM_SHA256` (0xC02B / 0xC02F / 0x009C)
+- `TLS_{ECDHE_ECDSA,ECDHE_RSA,RSA}_WITH_AES_256_GCM_SHA384` (0xC02C / 0xC030 / 0x009D)
+- `TLS_ECDHE_{RSA,ECDSA}_WITH_CHACHA20_POLY1305_SHA256` (0xCCA8 / 0xCCA9)
 
-Anything else (CBC suites, TLS 1.2 ChaCha20-Poly1305) stays in userspace.
+The legacy CBC suites (`AES_*_CBC_SHA`, 3DES, RC4) are the only ones left in userspace, and by design: they are MAC-then-encrypt, not AEAD, so the kernel has no interface to offload them (no TLS stack can). They are also deprecated and disabled by default in modern TLS configs. So in practice every cipher a current client negotiates gets offloaded.
 
 ## API
 

@@ -22,23 +22,31 @@ import (
 
 const tlsVersionTLS12 = 0x0303
 
-// tls12Params describes an offloadable TLS 1.2 AEAD suite, only AES-GCM is supported
-// ChaCha20-Poly1305 (RFC 7905) uses a 12-byte implicit nonce with a different
-// construction and stays in userspace
+// tls12Params describes an offloadable TLS 1.2 AEAD suite (AES-GCM or ChaCha20-Poly1305)
+// the two families pack crypto_info differently, see gcm
 type tls12Params struct {
 	kernelCipher uint16
 	keyLen       int
-	saltLen      int // fixed/implicit IV length (4 for GCM)
-	ivLen        int // explicit nonce length (8 for GCM)
+	fixedIVLen   int // write_IV length in the key block: 4 (GCM) or 12 (ChaCha20)
 	prfHash      func() hash.Hash
 	infoSize     uintptr
+	gcm          bool // GCM: iv = 8-byte explicit nonce (seq), salt = fixedIV.
+	// ChaCha20 (RFC 7905): iv = the 12-byte fixed IV, no salt, nonce = iv XOR seq
 }
 
+// keyed by cipher suite
+// only the bulk AEAD matters to the kernel, so the key exchange (ECDHE / RSA)
+// is irrelevant and every suite of a given AEAD maps to the same params
+// the PRF hash is fixed by the suite's SHA variant
 var tls12Lookup = map[uint16]tls12Params{
-	0xC02B: {51, 16, 4, 8, sha256.New, 40},    // ECDHE_ECDSA_AES_128_GCM_SHA256
-	0xC02F: {51, 16, 4, 8, sha256.New, 40},    // ECDHE_RSA_AES_128_GCM_SHA256
-	0xC02C: {52, 32, 4, 8, sha512.New384, 56}, // ECDHE_ECDSA_AES_256_GCM_SHA384
-	0xC030: {52, 32, 4, 8, sha512.New384, 56}, // ECDHE_RSA_AES_256_GCM_SHA384
+	0xC02B: {51, 16, 4, sha256.New, 40, true},    // ECDHE_ECDSA_AES_128_GCM_SHA256
+	0xC02F: {51, 16, 4, sha256.New, 40, true},    // ECDHE_RSA_AES_128_GCM_SHA256
+	0x009C: {51, 16, 4, sha256.New, 40, true},    // RSA_AES_128_GCM_SHA256
+	0xC02C: {52, 32, 4, sha512.New384, 56, true}, // ECDHE_ECDSA_AES_256_GCM_SHA384
+	0xC030: {52, 32, 4, sha512.New384, 56, true}, // ECDHE_RSA_AES_256_GCM_SHA384
+	0x009D: {52, 32, 4, sha512.New384, 56, true}, // RSA_AES_256_GCM_SHA384
+	0xCCA8: {54, 32, 12, sha256.New, 56, false},  // ECDHE_RSA_CHACHA20_POLY1305
+	0xCCA9: {54, 32, 12, sha256.New, 56, false},  // ECDHE_ECDSA_CHACHA20_POLY1305
 }
 
 // tls12PRF is the TLS 1.2 PRF (RFC 5246 5)
@@ -73,7 +81,7 @@ func deriveTLS12KeyBlock(master, clientRandom, serverRandom []byte, p tls12Param
 	seed = append(seed, serverRandom...)
 	seed = append(seed, clientRandom...)
 
-	kb := make([]byte, 2*p.keyLen+2*p.saltLen)
+	kb := make([]byte, 2*p.keyLen+2*p.fixedIVLen)
 	tls12PRF(master, "key expansion", seed, kb, p.prfHash)
 
 	off := 0
@@ -81,9 +89,9 @@ func deriveTLS12KeyBlock(master, clientRandom, serverRandom []byte, p tls12Param
 	off += p.keyLen
 	serverKey = kb[off : off+p.keyLen]
 	off += p.keyLen
-	clientIV = kb[off : off+p.saltLen]
-	off += p.saltLen
-	serverIV = kb[off : off+p.saltLen]
+	clientIV = kb[off : off+p.fixedIVLen]
+	off += p.fixedIVLen
+	serverIV = kb[off : off+p.fixedIVLen]
 	return
 }
 
@@ -92,19 +100,28 @@ func deriveTLS12KeyBlock(master, clientRandom, serverRandom []byte, p tls12Param
 // for TLS 1.2 GCM the 8-byte explicit nonce is the record sequence number
 // (matching crypto/tls and OpenSSL), so iv and rec_seq both start at the
 // post handshake sequence value
-func buildCryptoInfo12(key, salt []byte, recSeq uint64, p tls12Params) (unsafe.Pointer, uintptr) {
+func buildCryptoInfo12(key, fixedIV []byte, recSeq uint64, p tls12Params) (unsafe.Pointer, uintptr) {
 	buf := make([]byte, p.infoSize)
 	off := 0
 	binary.LittleEndian.PutUint16(buf[off:], tlsVersionTLS12)
 	off += 2
 	binary.LittleEndian.PutUint16(buf[off:], p.kernelCipher)
 	off += 2
-	binary.BigEndian.PutUint64(buf[off:], recSeq) // iv (explicit nonce)
-	off += p.ivLen
-	copy(buf[off:], key)
-	off += p.keyLen
-	copy(buf[off:], salt)
-	off += p.saltLen
+
+	if p.gcm {
+		binary.BigEndian.PutUint64(buf[off:], recSeq) // iv = explicit nonce = seq
+		off += 8
+		copy(buf[off:], key)
+		off += p.keyLen
+		copy(buf[off:], fixedIV) // salt = 4-byte fixed IV
+		off += p.fixedIVLen
+	} else {
+		copy(buf[off:], fixedIV) // ChaCha20: iv = 12-byte fixed IV, no salt
+		off += p.fixedIVLen
+		copy(buf[off:], key)
+		off += p.keyLen
+	}
+
 	binary.BigEndian.PutUint64(buf[off:], recSeq) // rec_seq
 	return unsafe.Pointer(&buf[0]), p.infoSize
 }
