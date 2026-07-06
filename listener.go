@@ -64,10 +64,6 @@ func (l *Listener) Accept() (net.Conn, error) {
 
 		rxRecSeq = uint64(counter.clientAppRecords()) // apprecs - 1, because the first record is just Finished
 	}
-
-	// drain any bytes that tls.Conn has already decrypted during the handshake
-	drained := drainTLSBuffer(tlsConn)
-
 	_, err = enableKTLS(rawConn, serverSecret, clientSecret, state.CipherSuite, rxRecSeq)
 	if err != nil {
 		l.onError(err)
@@ -85,8 +81,6 @@ func (l *Listener) Accept() (net.Conn, error) {
 	kc := &conn{
 		Conn:          rawConn,
 		state:         state,
-		drainedOnce:   len(drained) > 0,
-		drainedBytes:  drained,
 		fd:            fd,
 		cipherSuiteID: state.CipherSuite,
 		rxSecret:      ownedRxSecret,

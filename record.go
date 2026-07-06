@@ -18,12 +18,31 @@ type recordCounter struct {
 }
 
 func (rc *recordCounter) Read(b []byte) (int, error) {
+	// cap each read at the current record boundary so tls.Conn cannot overread
+	// into the following record and buffer its ciphertext in rawInput
+	// that buffered ciphertext would be invisible to the kernel after the kTLS handoff
+	// -> the kernel reads records from the wrong offset -> EINVAL/EMSGSIZE
+	// short reads should be fine, tls.Conn just reads again
+	if limit := rc.recordRemaining(); limit > 0 && limit < len(b) {
+		b = b[:limit]
+	}
+
 	n, err := rc.Conn.Read(b)
 	if n > 0 {
 		rc.parse(b[:n])
 	}
 
 	return n, err
+}
+
+// returns how many bytes are left in the record currently being read
+// the rest of the 5-byte header, or the rest of the body once known
+func (rc *recordCounter) recordRemaining() int {
+	if !rc.inBody {
+		return 5 - rc.headerN
+	}
+
+	return rc.bodyRem
 }
 
 func (rc *recordCounter) parse(data []byte) {

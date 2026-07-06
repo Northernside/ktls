@@ -19,69 +19,58 @@ type Conn interface {
 // Post handshake connection, reads and writes hit kTLS
 type conn struct {
 	net.Conn
-	state        tls.ConnectionState
-	drainedOnce  bool
-	drainedBytes []byte
+	state tls.ConnectionState
 
 	// for RX key updates
 	fd            int
 	cipherSuiteID uint16
 	rxSecret      []byte
 
-	onKeyUpdate func() error // kernel issued
+	onKeyUpdate func() error // test seam for the RX rekey (nil in production)
 }
 
-// drains any bytes that were decrypted by tls.Conn during the handshake but not yet read by the user
 func (c *conn) Read(b []byte) (int, error) {
-	if c.drainedOnce { // first drain the handshake leftovers before reading from the kernel
-		n := copy(b, c.drainedBytes)
-		c.drainedBytes = c.drainedBytes[n:]
-		if len(c.drainedBytes) == 0 {
-			c.drainedOnce = false
-			c.drainedBytes = nil
-		}
-
-		return n, nil
-	}
-
-	// the kernel pauses decryption and returns EKEYEXPIRED when a peer
-	// sends a KeyUpdate
-	// derive the next RX secret, rearm the socket and resume
-	// loop so that multiple KeyUpdates (including back-to-back ones with no application data
-	// between them) are all consumed
-	//
-	// maxConsecutiveKeyUpdates bounds a peer flooding KeyUpdates with no data,
-	// which would otherwise spin here
-	const maxConsecutiveKeyUpdates = 32
-	for updates := 0; ; {
+	// a TLS 1.3 peer can send post handshake control records (KeyUpdate) at any time
+	// the kernel will not hand a non data record to a plain read() and returns EIO
+	// (some kernels signal EKEYEXPIRED instead)
+	// when that happens we fetch the record via recvmsg, act on it (rekey RX for a KeyUpdate)
+	// and resume
+	// maxControlRecords bounds a peer flooding control records with no data
+	const maxControlRecords = 32
+	for handled := 0; ; {
 		n, err := c.Conn.Read(b)
-
-		if err == nil || c.rxSecret == nil || !isEKEYEXPIRED(err) {
-			return n, err
+		if err == nil {
+			return n, nil
 		}
 
-		// kernel might hand back application data alongside the key update signal
-		// discarding it here would drop plaintext and desync the record stream
-		// (surfacing later as EINVAL/EMSGSIZE) -> return it first
-		// the pending EKEYEXPIRED resurfaces on the next Read (with n == 0) and is
-		// handled by then
+		// data handed back alongside the signal must be returned, not dropped
+		// -> the signal resurfaces on the next read with n == 0
 		if n > 0 {
 			return n, nil
 		}
 
-		if updates++; updates > maxConsecutiveKeyUpdates {
+		if c.rxSecret == nil || !isPostHandshakeSignal(err) {
+			return n, err
+		}
+		if handled++; handled > maxControlRecords {
 			return 0, err
 		}
 
-		ku := c.onKeyUpdate
-		if ku == nil {
-			ku = c.handleKeyUpdate
-		}
-		if rerr := ku(); rerr != nil {
+		if rerr := c.handlePostHandshake(err); rerr != nil {
 			return 0, rerr
 		}
-		// retry the read under the freshly installed RX key
+		// control record consumed + RX rekeyed as needed -> retry the read
 	}
+}
+
+// rekeyRX advances the RX traffic secret one generation and rearms the kernel (RFC 8446 7.2)
+// uses the onKeyUpdate seam when set (tests)
+func (c *conn) rekeyRX() error {
+	if c.onKeyUpdate != nil {
+		return c.onKeyUpdate()
+	}
+
+	return c.handleKeyUpdate()
 }
 
 func (c *conn) handleKeyUpdate() error {
