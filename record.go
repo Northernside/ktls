@@ -1,9 +1,14 @@
 package ktls
 
-import "net"
+import (
+	"errors"
+	"net"
+	"syscall"
+)
 
 // recordCounter sits between the raw TCP conn and tls.Conn during the handshake
-// It counts TLS application_data records (type 0x17) going through so we can figure out the right RX record sequence number during kTLS setup
+// counts TLS application_data records (type 0x17) going through so we can figure
+// out the right RX record sequence number during kTLS setup
 type recordCounter struct {
 	net.Conn
 
@@ -15,6 +20,20 @@ type recordCounter struct {
 
 	appRecords int // 0x17 records seen so far (+ Finished)
 	partial    bool
+}
+
+// forwards to the wrapped conn, required because the userspace fallback returns
+// a *tls.Conn built on the recordCounter (not the raw socket) and callers unwrap
+// *tls.Conn via NetConn() then expect syscall.Conn to reach the fd
+// without this, TLS 1.2 and any kTLS-setup-failure fallback cannot be wrapped for
+// splice and gets dropped
+func (rc *recordCounter) SyscallConn() (syscall.RawConn, error) {
+	sc, ok := rc.Conn.(syscall.Conn)
+	if !ok {
+		return nil, errors.New("ktls: wrapped conn does not implement syscall.Conn")
+	}
+
+	return sc.SyscallConn()
 }
 
 func (rc *recordCounter) Read(b []byte) (int, error) {
