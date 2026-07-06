@@ -27,6 +27,8 @@ type conn struct {
 	fd            int
 	cipherSuiteID uint16
 	rxSecret      []byte
+
+	onKeyUpdate func() error // kernel issued
 }
 
 // drains any bytes that were decrypted by tls.Conn during the handshake but not yet read by the user
@@ -42,16 +44,44 @@ func (c *conn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	n, err := c.Conn.Read(b) // we need to update it with the next secret
-	if err != nil && c.rxSecret != nil && isEKEYEXPIRED(err) {
-		if rerr := c.handleKeyUpdate(); rerr != nil {
-			return n, rerr
+	// the kernel pauses decryption and returns EKEYEXPIRED when a peer
+	// sends a KeyUpdate
+	// derive the next RX secret, rearm the socket and resume
+	// loop so that multiple KeyUpdates (including back-to-back ones with no application data
+	// between them) are all consumed
+	//
+	// maxConsecutiveKeyUpdates bounds a peer flooding KeyUpdates with no data,
+	// which would otherwise spin here
+	const maxConsecutiveKeyUpdates = 32
+	for updates := 0; ; {
+		n, err := c.Conn.Read(b)
+
+		if err == nil || c.rxSecret == nil || !isEKEYEXPIRED(err) {
+			return n, err
 		}
 
-		return c.Conn.Read(b)
-	}
+		// kernel might hand back application data alongside the key update signal
+		// discarding it here would drop plaintext and desync the record stream
+		// (surfacing later as EINVAL/EMSGSIZE) -> return it first
+		// the pending EKEYEXPIRED resurfaces on the next Read (with n == 0) and is
+		// handled by then
+		if n > 0 {
+			return n, nil
+		}
 
-	return n, err
+		if updates++; updates > maxConsecutiveKeyUpdates {
+			return 0, err
+		}
+
+		ku := c.onKeyUpdate
+		if ku == nil {
+			ku = c.handleKeyUpdate
+		}
+		if rerr := ku(); rerr != nil {
+			return 0, rerr
+		}
+		// retry the read under the freshly installed RX key
+	}
 }
 
 func (c *conn) handleKeyUpdate() error {
