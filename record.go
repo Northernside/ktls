@@ -20,6 +20,40 @@ type recordCounter struct {
 
 	appRecords int // 0x17 records seen so far (+ Finished)
 	partial    bool
+
+	// TLS 1.2 setup: the first outbound bytes hold the ServerHello (for
+	// server_random), and records seen after the client ChangeCipherSpec give
+	// the RX sequence number (Finished is seq 0, so the count is the next seq)
+	outHead      []byte
+	sawClientCCS bool
+	postCCS      int
+}
+
+// captures the head of the first outbound flight (the ServerHello) so the
+// TLS 1.2 path can read server_random (only the first 43 bytes) out of it
+func (rc *recordCounter) Write(b []byte) (int, error) {
+	if len(rc.outHead) < 43 {
+		need := min(43-len(rc.outHead), len(b))
+		rc.outHead = append(rc.outHead, b[:need]...)
+	}
+
+	return rc.Conn.Write(b)
+}
+
+// returns the 32-byte server_random from the captured ServerHello
+// record header(5) + handshake header(4) + legacy_version(2) then random(32)
+func (rc *recordCounter) serverRandom() ([]byte, bool) {
+	if len(rc.outHead) < 43 || rc.outHead[0] != 0x16 || rc.outHead[5] != 0x02 {
+		return nil, false
+	}
+
+	return rc.outHead[11:43], true
+}
+
+// the number of records the client sent under the new cipher (after its ChangeCipherSpec)
+// equals the RX sequence number for kTLS 1.2
+func (rc *recordCounter) postCCSCount() int {
+	return rc.postCCS
 }
 
 // forwards to the wrapped conn, required because the userspace fallback returns
@@ -86,10 +120,7 @@ func (rc *recordCounter) parse(data []byte) {
 			rc.inBody = true
 
 			if rc.bodyRem == 0 {
-				if rc.headerBuf[0] == 0x17 {
-					rc.appRecords++
-				}
-
+				rc.onFullRecord(rc.headerBuf[0])
 				rc.inBody = false
 				rc.partial = false
 				continue
@@ -103,15 +134,31 @@ func (rc *recordCounter) parse(data []byte) {
 			return
 		}
 
-		// full record consumed, count it if it's app data
+		// full record consumed
 		data = data[rc.bodyRem:]
 		rc.bodyRem = 0
 		rc.inBody = false
 		rc.partial = false
 
-		if rc.headerBuf[0] == 0x17 {
-			rc.appRecords++
-		}
+		rc.onFullRecord(rc.headerBuf[0])
+	}
+}
+
+// updates the counters when a complete inbound record is seen
+// records after the client ChangeCipherSpec (0x14) count toward
+// the TLS 1.2 RX sequence
+// 0x17 (app data) counts toward the TLS 1.3 sequence
+func (rc *recordCounter) onFullRecord(recType byte) {
+	if recType == 0x17 {
+		rc.appRecords++
+	}
+
+	if rc.sawClientCCS {
+		rc.postCCS++
+	}
+
+	if recType == 0x14 {
+		rc.sawClientCCS = true // count records after this one, not the CCS itself
 	}
 }
 

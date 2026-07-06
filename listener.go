@@ -12,10 +12,8 @@ type Listener struct {
 	TCPListener net.Listener
 	TLSConfig   *tls.Config
 
-	// todo: might be unstable, opt in for now
-	RX bool
-
-	// connection still works fine through userspace TLS
+	// OnError is called when kTLS setup fails on a connection
+	// it still works hrough userspace TLS, nil ignores the error
 	OnError func(error)
 }
 
@@ -40,12 +38,20 @@ func (l *Listener) Accept() (net.Conn, error) {
 	}
 
 	state := tlsConn.ConnectionState()
-	if state.Version != tls.VersionTLS13 {
+	switch state.Version {
+	case tls.VersionTLS13:
+		// handled below
+	case tls.VersionTLS12:
+		if kc := l.setupKTLS12(rawConn, counter, state, keyBuf); kc != nil {
+			return kc, nil
+		}
+
+		return tlsConn, nil // unsupported 1.2 cipher or setup failed -> userspace
+	default:
 		return tlsConn, nil
 	}
 
-	// extract server and client traffic secrets
-
+	// TLS 1.3: extract the server and client application traffic secrets
 	var serverSecretBuf, clientSecretBuf [48]byte
 	serverSecret, err := parseTrafficSecret(keyBuf.String(), "SERVER_TRAFFIC_SECRET_0 ", serverSecretBuf[:])
 	if err != nil {
@@ -53,19 +59,14 @@ func (l *Listener) Accept() (net.Conn, error) {
 		return tlsConn, nil
 	}
 
-	var clientSecret []byte
-	var rxRecSeq uint64
-	if l.RX {
-		clientSecret, err = parseTrafficSecret(keyBuf.String(), "CLIENT_TRAFFIC_SECRET_0 ", clientSecretBuf[:])
-		if err != nil {
-			l.onError(fmt.Errorf("ktls: parse client secret: %w", err))
-			return tlsConn, nil
-		}
-
-		rxRecSeq = uint64(counter.clientAppRecords()) // apprecs - 1, because the first record is just Finished
-	}
-	_, err = enableKTLS(rawConn, serverSecret, clientSecret, state.CipherSuite, rxRecSeq)
+	clientSecret, err := parseTrafficSecret(keyBuf.String(), "CLIENT_TRAFFIC_SECRET_0 ", clientSecretBuf[:])
 	if err != nil {
+		l.onError(fmt.Errorf("ktls: parse client secret: %w", err))
+		return tlsConn, nil
+	}
+	rxRecSeq := uint64(counter.clientAppRecords()) // apprecs - 1, the first record is the Finished
+
+	if _, err = enableKTLS(rawConn, serverSecret, clientSecret, state.CipherSuite, rxRecSeq); err != nil {
 		l.onError(err)
 		return tlsConn, nil
 	}

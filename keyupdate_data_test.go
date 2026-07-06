@@ -26,7 +26,7 @@ func TestKeyUpdateWithData(t *testing.T) {
 	}
 	defer raw.Close()
 	raw.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second))
-	ln := &Listener{TCPListener: raw, TLSConfig: cfg, RX: true, OnError: func(e error) { t.Logf("onError: %v", e) }}
+	ln := &Listener{TCPListener: raw, TLSConfig: cfg, OnError: func(e error) { t.Logf("onError: %v", e) }}
 
 	const blockLen = 1200
 	blocks := []struct{ marker byte }{{'A'}, {'B'}, {'C'}, {'D'}}

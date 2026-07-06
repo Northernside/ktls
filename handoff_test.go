@@ -26,7 +26,7 @@ func TestKTLSHandoffNoByteLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	ln := &Listener{TCPListener: raw, TLSConfig: cfg, RX: true, OnError: func(e error) {}}
+	ln := &Listener{TCPListener: raw, TLSConfig: cfg, OnError: func(e error) {}}
 	addr := raw.Addr().String()
 
 	const payloadLen = 512 * 1024

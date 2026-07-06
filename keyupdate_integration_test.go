@@ -26,7 +26,7 @@ func TestKeyUpdateViaOpenSSL(t *testing.T) {
 	}
 	defer raw.Close()
 	raw.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second)) // bound Accept
-	ln := &Listener{TCPListener: raw, TLSConfig: cfg, RX: true, OnError: func(e error) { t.Logf("onError: %v", e) }}
+	ln := &Listener{TCPListener: raw, TLSConfig: cfg, OnError: func(e error) { t.Logf("onError: %v", e) }}
 
 	// s_client interprets a line "k"/"K" as a key_update command
 	// feed with small gaps so each command is processed as its own record in order
