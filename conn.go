@@ -3,6 +3,7 @@ package ktls
 import (
 	"crypto/tls"
 	"net"
+	"sync"
 	"syscall"
 )
 
@@ -21,12 +22,28 @@ type conn struct {
 	net.Conn
 	state tls.ConnectionState
 
-	// for RX key updates
 	fd            int
 	cipherSuiteID uint16
-	rxSecret      []byte
+
+	// RX key updates happen on the read goroutine
+	rxSecret []byte
+
+	// TX key updates (our response to a peer's update_requested) race concurrent
+	// writers, so txMu guards both Write and the TX rekey
+	txMu     sync.Mutex
+	txSecret []byte
 
 	onKeyUpdate func() error // test seam for the RX rekey (nil in production)
+}
+
+// holds txMu so a concurrent TX rekey (see sendKeyUpdateAndRekeyTX) cannot
+// swap the send key mid-write
+// uncontended in the common case (no key update)
+func (c *conn) Write(b []byte) (int, error) {
+	c.txMu.Lock()
+	n, err := c.Conn.Write(b)
+	c.txMu.Unlock()
+	return n, err
 }
 
 func (c *conn) Read(b []byte) (int, error) {

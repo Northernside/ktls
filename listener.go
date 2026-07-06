@@ -75,8 +75,13 @@ func (l *Listener) Accept() (net.Conn, error) {
 	var ownedRxSecret []byte
 	if clientSecret != nil {
 		ownedRxSecret = make([]byte, len(clientSecret))
-		copy(ownedRxSecret, clientSecret) // copy to owned buffer because conn outlives Accept() (clientSecret is on stack)
+		copy(ownedRxSecret, clientSecret)
 	}
+
+	// TX secret kept so we can answer a peer's update_requested KeyUpdate by
+	// rotating our own send key (RFC 8446 4.6.3)
+	ownedTxSecret := make([]byte, len(serverSecret))
+	copy(ownedTxSecret, serverSecret)
 
 	kc := &conn{
 		Conn:          rawConn,
@@ -84,6 +89,7 @@ func (l *Listener) Accept() (net.Conn, error) {
 		fd:            fd,
 		cipherSuiteID: state.CipherSuite,
 		rxSecret:      ownedRxSecret,
+		txSecret:      ownedTxSecret,
 	}
 
 	return kc, nil

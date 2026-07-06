@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -18,8 +19,10 @@ const (
 
 const handshakeKeyUpdate = 24 // 0x18
 
-// the SOL_TLS cmsg carrying a decrypted record's type
-const tlsGetRecordType = 2
+const (
+	tlsGetRecordType = 2
+	tlsSetRecordType = 1
+)
 
 // reports whether a read error means the kernel is holding a non-data record
 // (KeyUpdate) it will not deliver via plain read()
@@ -82,12 +85,76 @@ func (c *conn) onPostHandshakeMsg(msg []byte) error {
 	}
 
 	// msg[4] is request_update: 0 = not requested, 1 = update_requested
-	// per RFC 8446 4.6.3 a peer that sets update_requested wants us to send our
-	// own KeyUpdate (which would rekey our TX afaik)
-	// we intentionally do NOT do that here: rekeying TX would race concurrent writers
-	// (e.g. HTTP/2) and reads already work from the RX rekey above
-	// update_requested is rare and peers  tolerate the missing response
+	// per RFC 8446 4.6.3 a peer that sets update_requested requires us to send
+	// our own KeyUpdate (which rekeys our TX) before our next application data
+	if len(msg) >= 5 && msg[4] == 1 {
+		return c.sendKeyUpdateAndRekeyTX()
+	}
+
 	return nil
+}
+
+// sendKeyUpdateAndRekeyTX answers a peer's update_requested
+// emit a KeyUpdate(update_not_requested) handshake record under the current TX key,
+// then advance the TX key
+// txMu serializes this against Write so no record is ever sent split across the key change
+func (c *conn) sendKeyUpdateAndRekeyTX() error {
+	if c.txSecret == nil {
+		return nil // TX secret unavailable, nothing to rotate
+	}
+
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
+
+	// key_update handshake message: type(24) length(1) request_update(0)
+	keyUpdateMsg := []byte{handshakeKeyUpdate, 0x00, 0x00, 0x01, 0x00}
+	if err := c.sendControlRecord(recordHandshake, keyUpdateMsg); err != nil {
+		return err
+	}
+
+	next, err := deriveNextSecret(c.txSecret, c.cipherSuiteID)
+	if err != nil {
+		return err
+	}
+	if err := updateTX(c.fd, next, c.cipherSuiteID); err != nil {
+		return err
+	}
+
+	c.txSecret = next
+	return nil
+}
+
+// sendControlRecord writes payload as a record of the given TLS record type via
+// sendmsg with the SOL_TLS record-type cmsg (the kernel encrypts it under the
+// current TX key)
+func (c *conn) sendControlRecord(recordType byte, payload []byte) error {
+	sc, err := c.SyscallConn()
+	if err != nil {
+		return err
+	}
+	oob := recordTypeCmsg(recordType)
+
+	var serr error
+	ctlErr := sc.Write(func(fd uintptr) bool {
+		serr = syscall.Sendmsg(int(fd), payload, oob, nil, 0)
+		return serr != syscall.EAGAIN
+	})
+	if ctlErr != nil {
+		return ctlErr
+	}
+	return serr
+}
+
+// recordTypeCmsg builds the SOL_TLS / TLS_SET_RECORD_TYPE control message that
+// tells the kernel which TLS record type to stamp on the sent payload
+func recordTypeCmsg(recordType byte) []byte {
+	buf := make([]byte, syscall.CmsgSpace(1))
+	h := (*syscall.Cmsghdr)(unsafe.Pointer(&buf[0]))
+	h.Level = solTLS
+	h.Type = tlsSetRecordType
+	h.SetLen(syscall.CmsgLen(1))
+	buf[syscall.CmsgLen(0)] = recordType
+	return buf
 }
 
 // recvControlRecord reads a single record via recvmsg and returns its TLS record

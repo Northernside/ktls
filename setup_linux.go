@@ -177,6 +177,31 @@ func updateRX(fd int, secret []byte, cipherSuiteID uint16) error {
 	return nil
 }
 
+// provides kTLS TX with a new secret, used when we answer a peer's
+// update_requested KeyUpdate by rotating our own send key
+// the KeyUpdate record must already have been sent under the old key before calling this
+func updateTX(fd int, secret []byte, cipherSuiteID uint16) error {
+	info, infoLen, err := buildCryptoInfo(secret, cipherSuiteID, 0)
+	if err != nil {
+		return err
+	}
+
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_SETSOCKOPT,
+		uintptr(fd),
+		uintptr(solTLS),
+		uintptr(tlsTX),
+		uintptr(info),
+		infoLen,
+		0,
+	)
+	if errno != 0 {
+		return fmt.Errorf("ktls: TLS_TX update setsockopt: %w", errno)
+	}
+
+	return nil
+}
+
 // triggered from a recv syscall
 // indicates that the peer has initiated a key update
 func isEKEYEXPIRED(err error) bool {
