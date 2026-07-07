@@ -97,10 +97,139 @@ func (c *conn) spliceReadFrom(r io.Reader, cfg SpliceConfig) (n int64, handled b
 	return total + m, true, serr
 }
 
-// returns r's RawConn if it exposes a raw fd (sockets, files, pipes)
-// r must not have buffered reads pending -> splice reads straight from the fd
-func rawConnOf(r io.Reader) (syscall.RawConn, bool) {
-	sc, ok := r.(syscall.Conn)
+// drains the kTLS RX stream into w zerocopy when w exposes a raw fd
+// data is spliced kTLS-fd -> pipe -> w-fd and the kernel decrypts on the way out
+// handled is false when w is not an fd sink, so the caller falls backs
+func (c *conn) spliceWriteTo(w io.Writer, cfg SpliceConfig) (n int64, handled bool, err error) {
+	dstSC, ok := rawConnOf(w)
+	if !ok {
+		return 0, false, nil // not an fd sink -> generic copy
+	}
+
+	pipe, ok := getSplicePipe()
+	if !ok {
+		return 0, false, nil
+	}
+	defer putSplicePipe(pipe)
+
+	var total int64
+
+	// peek: pull the leading window via Read (which handles KeyUpdate), observe
+	// it, then write it straight to the plain dst (no kTLS sequencing on w)
+	if cfg.PeekN > 0 && cfg.Peek != nil {
+		buf := make([]byte, cfg.PeekN)
+		got, eof, rerr := c.readUpTo(buf)
+		if got > 0 {
+			cfg.Peek(buf[:got])
+			sent, werr := writeAll(w, buf[:got])
+			total += int64(sent)
+			if werr != nil {
+				return total, true, werr
+			}
+		}
+		if rerr != nil {
+			return total, true, rerr
+		}
+		if eof {
+			return total, true, nil
+		}
+	}
+
+	m, serr := c.spliceStreamRX(w, dstSC, pipe)
+	return total + m, true, serr
+}
+
+// moves the kTLS RX stream -> pipe -> dst (w) until EOF
+// splice(2) on a kTLS socket only works for a fully-arrived data record
+// when the next record is still partial the kernel returns EINVAL (not EAGAIN)
+// and a peer KeyUpdate/alert surfaces as EIO
+// for every non-EAGAIN case we fall back to a single Read of that chunk
+// Read waits for the full record, decrypts it, and handles KeyUpdate + close_notify
+// so aligned records go zerocopy and the awkward boundaries take one buffered copy, should prevent busy spins
+func (c *conn) spliceStreamRX(w io.Writer, dstSC syscall.RawConn, pipe *[2]int) (int64, error) {
+	srcSC, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+
+	var total int64
+	var rbuf []byte // lazily allocated for the read fallback
+	for {
+		var got int64
+		var fallback bool
+		rerr := srcSC.Read(func(fd uintptr) bool {
+			m, e := unix.Splice(int(fd), nil, pipe[1], nil, splicePipeSize, spliceFlags)
+			if e == syscall.EAGAIN {
+				return false // no data at all -> park on the netpoller
+			}
+			if e != nil {
+				fallback = true // partial record, control record, etc -> use Read
+				return true
+			}
+			got = int64(m)
+			return true
+		})
+		if rerr != nil {
+			return total, rerr
+		}
+
+		if fallback {
+			if rbuf == nil {
+				rbuf = make([]byte, 64*1024)
+			}
+			n, e := c.Read(rbuf) // waits for a full record, KeyUpdate-aware
+			if n > 0 {
+				ww, we := writeAll(w, rbuf[:n])
+				total += int64(ww)
+				if we != nil {
+					return total, we
+				}
+			}
+			if e != nil {
+				if e == io.EOF {
+					return total, nil // close_notify / clean end
+				}
+				return total, e
+			}
+
+			continue
+		}
+
+		if got == 0 {
+			return total, nil // EOF
+		}
+
+		s, err := spliceFromPipe(dstSC, pipe[0], int(got))
+		total += s
+		if err != nil {
+			return total, err
+		}
+	}
+}
+
+// fills buf via Read (KeyUpdate-aware), stopping at len(buf) or EOF
+func (c *conn) readUpTo(buf []byte) (got int, eof bool, err error) {
+	for got < len(buf) {
+		n, e := c.Read(buf[got:])
+		got += n
+		if e != nil {
+			if e == io.EOF {
+				return got, true, nil
+			}
+			return got, false, e
+		}
+		if n == 0 {
+			return got, true, nil
+		}
+	}
+	return got, false, nil
+}
+
+// returns v's RawConn if it exposes a raw fd (sockets, files, pipes)
+// v must not have buffered data pending -> splice hits the fd directly
+// works for both a source (io.Reader) and a sink (io.Writer)
+func rawConnOf(v any) (syscall.RawConn, bool) {
+	sc, ok := v.(syscall.Conn)
 	if !ok {
 		return nil, false
 	}

@@ -13,13 +13,15 @@ import (
 type Conn interface {
 	net.Conn
 	syscall.Conn
-	io.ReaderFrom // zerocopy splice on io.Copy(conn, rawFdSource)
+	io.ReaderFrom // zerocopy splice on io.Copy(conn, rawFdSource) (TX)
+	io.WriterTo   // zerocopy splice on io.Copy(rawFdSink, conn) (RX)
 
 	ConnectionState() tls.ConnectionState
 	DidResume() bool
 
-	// ReadFrom with an optional userspace peek (see SpliceConfig)
+	// ReadFrom / WriteTo with an optional userspace peek (see SpliceConfig)
 	ReadFromConfig(r io.Reader, cfg SpliceConfig) (int64, error)
+	WriteToConfig(w io.Writer, cfg SpliceConfig) (int64, error)
 }
 
 // Post handshake connection, reads and writes hit kTLS

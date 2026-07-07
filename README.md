@@ -83,39 +83,51 @@ Both encryption (TX) and decryption (RX) are offloaded. `Request.TLS` is populat
 
 If any step fails, `Accept()` returns the original `tls.Conn` and calls `OnError`. The connection works fine either way.
 
-## Zerocopy reads (splice)
+## Zerocopy (splice)
 
-A kTLS-active `Conn` implements `io.ReaderFrom`. When the source is a raw file descriptor (a TCP/unix socket, a file, a pipe), the copy runs entirely in the kernel via `splice(2)`: bytes go source-fd -> pipe -> the kTLS socket, and the kernel encrypts each chunk on the way out. Userspace never touches the payload and never runs the cipher.
+A kTLS-active `Conn` splices in both directions, so the payload never enters userspace and userspace never runs the cipher:
+
+- **Send (TX)** (download/response) - `Conn` implements `io.ReaderFrom`. `io.Copy(conn, src)` splices src-fd -> pipe -> the kTLS socket (the kernel encrypts each chunk on the way out)
+- **Receive (RX)** (upload/request) - `Conn` implements `io.WriterTo`. `io.Copy(dst, conn)` splices the kTLS socket -> pipe -> dst-fd (the kernel decrypts on the way out)
 
 ```go
-// backend is a *net.TCPConn (or any raw-fd source)
-// conn is the kTLS Conn
-// io.Copy dispatches to Conn.ReadFrom, which splices
-// no userspace copy & crypto
-io.Copy(conn, backend)
+// backend and conn are both raw-fd endpoints (conn is the kTLS Conn)
+io.Copy(conn, backend) // download: splice into TX, kernel-encrypted
+io.Copy(backend, conn) // upload:   splice out of RX, kernel-decrypted
 ```
+
+There is no zerocopy `Write([]byte)` from a userspace buffer. The bytes already live in userspace and the cipher has to read them, so `copy_from_user` is unavoidable. Zerocopy only exists when both ends are file descriptors and the kernel can move the data itself. That's what `ReadFrom`/`WriteTo` (i.e. `io.Copy` to/from another fd) give you.
 
 Encryption offload on its own is roughly a wash against Go's (already fast) userspace AES-GCM. The win comes from splice removing the userspace copy and the syscall overhead. On a plain proxy download it lands H1-style streaming within ~10% of the line rate at a fraction of the CPU. It only applies where the body is an untransformed byte stream from a raw fd. HTTP/2 (which frames in userspace), compressed, ranged, or otherwise transformed bodies can't splice and fall back automatically.
 
+One asymmetry: splicing *out of* a kTLS socket (RX) only works for a fully-arrived record - when the next record is still partial the kernel returns `EINVAL`. `WriteTo` handles this transparently by falling back to a single buffered `Read` for that record (which also covers KeyUpdate and close_notify), so aligned records go zerocopy and awkward boundaries take one copy. On a fast local link most records splice. Over a lossy WAN more of them fall back.
+
 ### Peeking while you splice
 
-Sometimes you want the first few bytes in userspace (log a line, sniff a content type, sample a body) without giving up zerocopy for the rest. `ReadFromConfig` copies a small leading window into userspace, hands it to a callback, then splices everything after it:
+Sometimes you want the first few bytes in userspace (log a line, sniff a content type, sample a body) without giving up zerocopy for the rest. `ReadFromConfig` / `WriteToConfig` copy a small leading window into userspace, hand it to a callback, then splice everything after it:
 
 ```go
+// download: observe the first bytes we send
 n, err := conn.ReadFromConfig(backend, ktls.SpliceConfig{
     PeekN: 512,
     Peek:  func(b []byte) { log.Printf("first %d bytes: %q", len(b), b) },
 })
+
+// upload: observe the first bytes we receive (e.g. request line + headers)
+n, err := conn.WriteToConfig(backend, ktls.SpliceConfig{
+    PeekN: 512,
+    Peek:  func(b []byte) { log.Printf("upload head: %q", b) },
+})
 ```
 
-Only those first `PeekN` bytes cost a userspace copy; the remainder stays in the kernel. The peeked bytes are still sent to the peer - `Peek` is read-only (mutating the slice changes nothing) and the slice is valid only for the duration of the call, so copy out anything you keep.
+Only those first `PeekN` bytes cost a userspace copy; the remainder stays in the kernel. The peeked bytes are still forwarded - `Peek` is read-only (mutating the slice changes nothing) and the slice is valid only for the duration of the call, so copy out anything you keep.
 
 Constraints:
 
-- **Raw-fd source only.** If the source doesn't expose a file descriptor (or has buffered reads pending in userspace), `ReadFrom`/`ReadFromConfig` transparently fall back to a normal buffered copy. Correctness is never at stake, only the zerocopy fast path.
+- **Raw-fd endpoint only.** If the other end doesn't expose a file descriptor (or has buffered data pending in userspace), `ReadFrom`/`WriteTo` transparently fall back to a normal buffered copy. Correctness is never at stake, only the zerocopy fast path.
 - **Keep `PeekN` small.** It's a few-KB window for headers/sniffing. A large `PeekN` just shrinks the zerocopy portion.
-- **Don't interleave `Write` with `ReadFrom` for one logical response.** Both advance the kTLS TX record sequence. The peek is deliberately routed back through the splice path (not `Write`) for this reason. Interleaving your own `Write` and `ReadFrom` sequences correctly on the kernels tested here, but routing a given response through one path is the safe contract.
-- **splice only, `net/http` unaffected.** `net/http` buffers response bodies through its own writer, so it doesn't hit this path unless it takes its `sendfile` shortcut for a `*os.File` body - which is exactly the case splice is meant for.
+- **Don't interleave `Write`/`Read` with `ReadFrom`/`WriteTo` for one logical stream.** Both advance the kTLS record sequence. The peek is deliberately routed back through the splice/Read path for this reason. Interleaving sequences correctly on the kernels tested here, but routing a given stream through one path is the safe contract.
+- **splice only, `net/http` unaffected.** `net/http` buffers bodies through its own writer, so it doesn't hit this path unless it takes its `sendfile` shortcut for a `*os.File` body - which is exactly the case splice is meant for.
 
 ## Key updates (TLS 1.3)
 
@@ -166,7 +178,7 @@ Implements `net.Listener`. Pass it to `http.Serve`, `http.Server.Serve`, or anyt
 
 ### `Conn`
 
-Connections that were successfully offloaded satisfy `ktls.Conn` (a `net.Conn` that also implements `syscall.Conn` and `io.ReaderFrom`, and exposes `ConnectionState()` / `DidResume()` / `ReadFromConfig()`). Type-assert to it to distinguish kTLS-active connections from userspace fallbacks, to reach the raw fd for `sendfile` / `splice`, or to drive zerocopy reads (see [zerocopy reads](#zerocopy-reads-splice)).
+Connections that were successfully offloaded satisfy `ktls.Conn` (a `net.Conn` that also implements `syscall.Conn` and `io.ReaderFrom`, and exposes `ConnectionState()` / `DidResume()` / `ReadFromConfig()`). Type-assert to it to distinguish kTLS-active connections from userspace fallbacks, to reach the raw fd for `sendfile` / `splice`, or to drive zerocopy transfers (see [zerocopy](#zerocopy-splice)).
 
 ### `Available() bool`
 
