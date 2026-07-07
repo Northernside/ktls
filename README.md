@@ -83,6 +83,40 @@ Both encryption (TX) and decryption (RX) are offloaded. `Request.TLS` is populat
 
 If any step fails, `Accept()` returns the original `tls.Conn` and calls `OnError`. The connection works fine either way.
 
+## Zerocopy reads (splice)
+
+A kTLS-active `Conn` implements `io.ReaderFrom`. When the source is a raw file descriptor (a TCP/unix socket, a file, a pipe), the copy runs entirely in the kernel via `splice(2)`: bytes go source-fd -> pipe -> the kTLS socket, and the kernel encrypts each chunk on the way out. Userspace never touches the payload and never runs the cipher.
+
+```go
+// backend is a *net.TCPConn (or any raw-fd source)
+// conn is the kTLS Conn
+// io.Copy dispatches to Conn.ReadFrom, which splices
+// no userspace copy & crypto
+io.Copy(conn, backend)
+```
+
+Encryption offload on its own is roughly a wash against Go's (already fast) userspace AES-GCM. The win comes from splice removing the userspace copy and the syscall overhead. On a plain proxy download it lands H1-style streaming within ~10% of the line rate at a fraction of the CPU. It only applies where the body is an untransformed byte stream from a raw fd. HTTP/2 (which frames in userspace), compressed, ranged, or otherwise transformed bodies can't splice and fall back automatically.
+
+### Peeking while you splice
+
+Sometimes you want the first few bytes in userspace (log a line, sniff a content type, sample a body) without giving up zerocopy for the rest. `ReadFromConfig` copies a small leading window into userspace, hands it to a callback, then splices everything after it:
+
+```go
+n, err := conn.ReadFromConfig(backend, ktls.SpliceConfig{
+    PeekN: 512,
+    Peek:  func(b []byte) { log.Printf("first %d bytes: %q", len(b), b) },
+})
+```
+
+Only those first `PeekN` bytes cost a userspace copy; the remainder stays in the kernel. The peeked bytes are still sent to the peer - `Peek` is read-only (mutating the slice changes nothing) and the slice is valid only for the duration of the call, so copy out anything you keep.
+
+Constraints:
+
+- **Raw-fd source only.** If the source doesn't expose a file descriptor (or has buffered reads pending in userspace), `ReadFrom`/`ReadFromConfig` transparently fall back to a normal buffered copy. Correctness is never at stake, only the zerocopy fast path.
+- **Keep `PeekN` small.** It's a few-KB window for headers/sniffing. A large `PeekN` just shrinks the zerocopy portion.
+- **Don't interleave `Write` with `ReadFrom` for one logical response.** Both advance the kTLS TX record sequence. The peek is deliberately routed back through the splice path (not `Write`) for this reason. Interleaving your own `Write` and `ReadFrom` sequences correctly on the kernels tested here, but routing a given response through one path is the safe contract.
+- **splice only, `net/http` unaffected.** `net/http` buffers response bodies through its own writer, so it doesn't hit this path unless it takes its `sendfile` shortcut for a `*os.File` body - which is exactly the case splice is meant for.
+
 ## Key updates (TLS 1.3)
 
 TLS 1.3 peers can send a `KeyUpdate` at any point on a long-lived connection. The kernel will not deliver a control record to a plain `read()` - it returns `EIO` (some kernels signal `EKEYEXPIRED` instead). The library detects this, fetches the record with `recvmsg` plus the `TLS_GET_RECORD_TYPE` control message, and:
@@ -132,7 +166,7 @@ Implements `net.Listener`. Pass it to `http.Serve`, `http.Server.Serve`, or anyt
 
 ### `Conn`
 
-Connections that were successfully offloaded satisfy `ktls.Conn` (a `net.Conn` that also implements `syscall.Conn` and exposes `ConnectionState()` / `DidResume()`). Type-assert to it to distinguish kTLS-active connections from userspace fallbacks, or to reach the raw fd for `sendfile` / `splice`.
+Connections that were successfully offloaded satisfy `ktls.Conn` (a `net.Conn` that also implements `syscall.Conn` and `io.ReaderFrom`, and exposes `ConnectionState()` / `DidResume()` / `ReadFromConfig()`). Type-assert to it to distinguish kTLS-active connections from userspace fallbacks, to reach the raw fd for `sendfile` / `splice`, or to drive zerocopy reads (see [zerocopy reads](#zerocopy-reads-splice)).
 
 ### `Available() bool`
 
