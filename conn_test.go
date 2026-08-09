@@ -13,9 +13,10 @@ import (
 // fakeConn scripts a sequence of (n bytes written into b, error) results for
 // successive Read calls, so the KeyUpdate loop can be exercised without kTLS
 type fakeConn struct {
+	netConnStub
+
 	stepReads []fakeRead
 	i         int
-	netConnStub
 }
 
 type fakeRead struct {
@@ -31,6 +32,7 @@ func (f *fakeConn) Read(b []byte) (int, error) {
 	r := f.stepReads[f.i]
 	f.i++
 	n := copy(b, r.data)
+
 	return n, r.err
 }
 
@@ -50,9 +52,14 @@ func TestReadHandlesMultipleKeyUpdates(t *testing.T) {
 		{nil, ekeyexpired()},   // KeyUpdate #1
 		{nil, ekeyexpired()},   // KeyUpdate #2 back-to-back
 		{[]byte("hello"), nil}, // real data after rekeying twice
-	}, func() error { updates++; return nil })
+	}, func() error {
+		updates++
+
+		return nil
+	})
 
 	buf := make([]byte, 16)
+
 	n, err := c.Read(buf)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -72,9 +79,14 @@ func TestReadReturnsDataBeforeKeyUpdate(t *testing.T) {
 	updates := 0
 	c := newTestConn([]fakeRead{
 		{[]byte("payload"), ekeyexpired()},
-	}, func() error { updates++; return nil })
+	}, func() error {
+		updates++
+
+		return nil
+	})
 
 	buf := make([]byte, 16)
+
 	n, err := c.Read(buf)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -92,6 +104,7 @@ func TestReadReturnsDataBeforeKeyUpdate(t *testing.T) {
 func TestReadPassesThroughNonKeyUpdateErrors(t *testing.T) {
 	sentinel := errors.New("boom")
 	c := newTestConn([]fakeRead{{nil, sentinel}}, func() error { return nil })
+
 	buf := make([]byte, 16)
 	if _, err := c.Read(buf); !errors.Is(err, sentinel) {
 		t.Fatalf("got %v, want sentinel", err)
@@ -106,6 +119,7 @@ func TestReadBoundsKeyUpdateFlood(t *testing.T) {
 	}
 
 	c := newTestConn(reads, func() error { return nil })
+
 	buf := make([]byte, 16)
 	if _, err := c.Read(buf); !isEKEYEXPIRED(err) {
 		t.Fatalf("expected bounded loop to return EKEYEXPIRED, got %v", err)

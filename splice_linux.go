@@ -3,6 +3,7 @@
 package ktls
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"syscall"
@@ -20,11 +21,14 @@ const (
 var splicePipePool = sync.Pool{
 	New: func() any {
 		var fds [2]int
-		if err := unix.Pipe2(fds[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
+
+		err := unix.Pipe2(fds[:], unix.O_NONBLOCK|unix.O_CLOEXEC)
+		if err != nil {
 			return nil
 		}
 
 		unix.FcntlInt(uintptr(fds[0]), unix.F_SETPIPE_SZ, splicePipeSize)
+
 		return &fds
 	},
 }
@@ -47,6 +51,7 @@ func putSplicePipe(fds *[2]int) {
 			break
 		}
 	}
+
 	splicePipePool.Put(fds)
 }
 
@@ -59,6 +64,7 @@ func (c *conn) spliceReadFrom(r io.Reader, cfg SpliceConfig) (n int64, handled b
 	if !ok {
 		return 0, false, nil // not an fd source -> generic copy
 	}
+
 	dstSC, derr := c.SyscallConn()
 	if derr != nil {
 		return 0, false, nil
@@ -76,24 +82,29 @@ func (c *conn) spliceReadFrom(r io.Reader, cfg SpliceConfig) (n int64, handled b
 	// through the pipe -> splice path (not Write, which would desync the TX seq)
 	if cfg.PeekN > 0 && cfg.Peek != nil {
 		buf := make([]byte, cfg.PeekN)
+
 		got, eof, rerr := readSome(srcSC, buf)
 		if rerr != nil {
 			return total, true, rerr
 		}
+
 		if got > 0 {
 			cfg.Peek(buf[:got])
 			sent, werr := pipeForward(dstSC, pipe, buf[:got])
+
 			total += sent
 			if werr != nil {
 				return total, true, werr
 			}
 		}
+
 		if eof {
 			return total, true, nil
 		}
 	}
 
 	m, serr := spliceStream(dstSC, srcSC, pipe)
+
 	return total + m, true, serr
 }
 
@@ -118,24 +129,29 @@ func (c *conn) spliceWriteTo(w io.Writer, cfg SpliceConfig) (n int64, handled bo
 	// it, then write it straight to the plain dst (no kTLS sequencing on w)
 	if cfg.PeekN > 0 && cfg.Peek != nil {
 		buf := make([]byte, cfg.PeekN)
+
 		got, eof, rerr := c.readUpTo(buf)
 		if got > 0 {
 			cfg.Peek(buf[:got])
 			sent, werr := writeAll(w, buf[:got])
+
 			total += int64(sent)
 			if werr != nil {
 				return total, true, werr
 			}
 		}
+
 		if rerr != nil {
 			return total, true, rerr
 		}
+
 		if eof {
 			return total, true, nil
 		}
 	}
 
 	m, serr := c.spliceStreamRX(w, dstSC, pipe)
+
 	return total + m, true, serr
 }
 
@@ -153,20 +169,29 @@ func (c *conn) spliceStreamRX(w io.Writer, dstSC syscall.RawConn, pipe *[2]int) 
 	}
 
 	var total int64
+
 	var rbuf []byte // lazily allocated for the read fallback
+
 	for {
-		var got int64
-		var fallback bool
+		var (
+			got      int64
+			fallback bool
+		)
+
 		rerr := srcSC.Read(func(fd uintptr) bool {
 			m, e := unix.Splice(int(fd), nil, pipe[1], nil, splicePipeSize, spliceFlags)
-			if e == syscall.EAGAIN {
+			if errors.Is(e, syscall.EAGAIN) {
 				return false // no data at all -> park on the netpoller
 			}
+
 			if e != nil {
 				fallback = true // partial record, control record, etc -> use Read
+
 				return true
 			}
-			got = int64(m)
+
+			got = m
+
 			return true
 		})
 		if rerr != nil {
@@ -177,18 +202,22 @@ func (c *conn) spliceStreamRX(w io.Writer, dstSC syscall.RawConn, pipe *[2]int) 
 			if rbuf == nil {
 				rbuf = make([]byte, 64*1024)
 			}
+
 			n, e := c.Read(rbuf) // waits for a full record, KeyUpdate-aware
 			if n > 0 {
 				ww, we := writeAll(w, rbuf[:n])
+
 				total += int64(ww)
 				if we != nil {
 					return total, we
 				}
 			}
+
 			if e != nil {
-				if e == io.EOF {
+				if errors.Is(e, io.EOF) {
 					return total, nil // close_notify / clean end
 				}
+
 				return total, e
 			}
 
@@ -200,6 +229,7 @@ func (c *conn) spliceStreamRX(w io.Writer, dstSC syscall.RawConn, pipe *[2]int) 
 		}
 
 		s, err := spliceFromPipe(dstSC, pipe[0], int(got))
+
 		total += s
 		if err != nil {
 			return total, err
@@ -212,16 +242,20 @@ func (c *conn) readUpTo(buf []byte) (got int, eof bool, err error) {
 	for got < len(buf) {
 		n, e := c.Read(buf[got:])
 		got += n
+
 		if e != nil {
-			if e == io.EOF {
+			if errors.Is(e, io.EOF) {
 				return got, true, nil
 			}
+
 			return got, false, e
 		}
+
 		if n == 0 {
 			return got, true, nil
 		}
 	}
+
 	return got, false, nil
 }
 
@@ -248,37 +282,46 @@ func rawConnOf(v any) (syscall.RawConn, bool) {
 // eof is true only when the source is at EOF before any byte.
 func readSome(sc syscall.RawConn, buf []byte) (got int, eof bool, err error) {
 	var firstErr error
+
 	rerr := sc.Read(func(fd uintptr) bool {
 		m, e := unix.Read(int(fd), buf)
-		if e == syscall.EAGAIN {
+		if errors.Is(e, syscall.EAGAIN) {
 			return false // park, epoll-wait, retry
 		}
+
 		got = m
 		firstErr = e
+
 		return true
 	})
 	if rerr != nil {
 		return 0, false, rerr
 	}
+
 	if firstErr != nil {
 		return got, false, firstErr
 	}
+
 	if got == 0 {
 		return 0, true, nil // EOF before any data
 	}
 
 	for got < len(buf) {
 		var m int
+
 		sc.Control(func(fd uintptr) {
 			v, e := unix.Read(int(fd), buf[got:])
 			if e != nil || v <= 0 {
 				return // EAGAIN or EOF -> stop the greedy fill
 			}
+
 			m = v
 		})
+
 		if m == 0 {
 			break
 		}
+
 		got += m
 	}
 
@@ -290,11 +333,10 @@ func readSome(sc syscall.RawConn, buf []byte) (got int, eof bool, err error) {
 // writing the next), so a chunk that fits the pipe never blocks on write
 func pipeForward(dstSC syscall.RawConn, pipe *[2]int, data []byte) (int64, error) {
 	var total int64
+
 	for off := 0; off < len(data); {
-		end := off + splicePipeSize
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(off+splicePipeSize, len(data))
+
 		chunk := data[off:end]
 
 		for w := 0; w < len(chunk); {
@@ -302,15 +344,19 @@ func pipeForward(dstSC syscall.RawConn, pipe *[2]int, data []byte) (int64, error
 			if m > 0 {
 				w += m
 			}
-			if err != nil && err != syscall.EAGAIN {
+
+			if err != nil && !errors.Is(err, syscall.EAGAIN) {
 				return total, err
 			}
 		}
+
 		s, err := spliceFromPipe(dstSC, pipe[0], len(chunk))
+
 		total += s
 		if err != nil {
 			return total, err
 		}
+
 		off = end
 	}
 
@@ -321,29 +367,38 @@ func pipeForward(dstSC syscall.RawConn, pipe *[2]int, data []byte) (int64, error
 // parking on the netpoller for both readability and writability
 func spliceStream(dstSC, srcSC syscall.RawConn, pipe *[2]int) (int64, error) {
 	var total int64
+
 	for {
-		var inN int64
-		var inErr error
+		var (
+			inN   int64
+			inErr error
+		)
+
 		rerr := srcSC.Read(func(fd uintptr) bool {
 			m, err := unix.Splice(int(fd), nil, pipe[1], nil, splicePipeSize, spliceFlags)
-			if err == syscall.EAGAIN {
+			if errors.Is(err, syscall.EAGAIN) {
 				return false
 			}
-			inN = int64(m)
+
+			inN = m
 			inErr = err
+
 			return true
 		})
 		if rerr != nil {
 			return total, rerr
 		}
+
 		if inErr != nil {
 			return total, inErr
 		}
+
 		if inN == 0 {
 			return total, nil // src EOF
 		}
 
 		s, err := spliceFromPipe(dstSC, pipe[0], int(inN))
+
 		total += s
 		if err != nil {
 			return total, err
@@ -356,26 +411,34 @@ func spliceStream(dstSC, srcSC syscall.RawConn, pipe *[2]int) (int64, error) {
 func spliceFromPipe(dstSC syscall.RawConn, pipeRd int, limit int) (int64, error) {
 	var written int64
 	for written < int64(limit) {
-		var m int64
-		var opErr error
+		var (
+			m     int64
+			opErr error
+		)
+
 		werr := dstSC.Write(func(fd uintptr) bool {
 			v, err := unix.Splice(pipeRd, nil, int(fd), nil, limit-int(written), spliceFlags)
-			if err == syscall.EAGAIN {
+			if errors.Is(err, syscall.EAGAIN) {
 				return false
 			}
-			m = int64(v)
+
+			m = v
 			opErr = err
+
 			return true
 		})
 		if werr != nil {
 			return written, werr
 		}
+
 		if opErr != nil {
 			return written, opErr
 		}
+
 		if m == 0 {
 			return written, io.ErrUnexpectedEOF
 		}
+
 		written += m
 	}
 

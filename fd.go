@@ -18,6 +18,7 @@ func getRawFd(conn net.Conn) (int, error) {
 	}
 
 	var fd int
+
 	err = rawConn.Control(func(f uintptr) {
 		fd = int(f)
 	})

@@ -2,9 +2,17 @@ package ktls
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
+	"time"
 )
+
+// DefaultHandshakeTimeout is the maximum time a single TLS handshake is allowed
+// to take when the caller has not configured HandshakeTimeout explicitly.
+// It bounds the server goroutine a slow or malicious client can hold open during
+// the handshake (the TCP listener deadline only bounds Accept, not Handshake).
+const DefaultHandshakeTimeout = 10 * time.Second
 
 // Listener wraps a TCP listener, does the TLS handshake in userspace,
 // then hands the socket off to the kernel for TLS record encryption and decryption
@@ -12,8 +20,15 @@ type Listener struct {
 	TCPListener net.Listener
 	TLSConfig   *tls.Config
 
+	// HandshakeTimeout bounds the TLS handshake performed during Accept. A zero or
+	// negative value falls back to DefaultHandshakeTimeout. Without a deadline a
+	// malicious or slow client can open a TCP connection, complete nothing, and
+	// hold a server goroutine indefinitely (slowloris). The deadline is applied to
+	// the raw conn only for the duration of Handshake and cleared afterwards.
+	HandshakeTimeout time.Duration
+
 	// OnError is called when kTLS setup fails on a connection
-	// it still works hrough userspace TLS, nil ignores the error
+	// it still works through userspace TLS, nil ignores the error
 	OnError func(error)
 }
 
@@ -21,6 +36,14 @@ func (l *Listener) Accept() (net.Conn, error) {
 	rawConn, err := l.TCPListener.Accept()
 	if err != nil {
 		return nil, err
+	}
+
+	// a nil config would dereference nil on Clone and panic deep inside
+	// crypto/tls; surface it as a clear, actionable error instead.
+	if l.TLSConfig == nil {
+		rawConn.Close()
+
+		return nil, errors.New("ktls: Listener.TLSConfig must not be nil")
 	}
 
 	counter := &recordCounter{Conn: rawConn}
@@ -32,9 +55,29 @@ func (l *Listener) Accept() (net.Conn, error) {
 	cfg.KeyLogWriter = keyBuf
 
 	tlsConn := tls.Server(counter, cfg)
-	if err := tlsConn.Handshake(); err != nil {
+
+	// Bound the handshake so a slow/stalled client cannot hold this server
+	// goroutine open indefinitely (slowloris). The deadline applies to the raw
+	// conn only for the handshake and is cleared immediately after, so the
+	// returned connection inherits no inherited deadline. We use SetDeadline
+	// (both read+write) because Handshake reads and writes on the same conn.
+	timeout := l.HandshakeTimeout
+	if timeout <= 0 {
+		timeout = DefaultHandshakeTimeout
+	}
+
+	deadline := time.Now().Add(timeout)
+	_ = rawConn.SetDeadline(deadline)
+
+	handshakeErr := tlsConn.Handshake()
+
+	// always clear the handshake deadline so it does not leak onto post-handshake I/O
+	_ = rawConn.SetDeadline(time.Time{})
+
+	if handshakeErr != nil {
 		rawConn.Close()
-		return nil, err
+
+		return nil, handshakeErr
 	}
 
 	state := tlsConn.ConnectionState()
@@ -53,25 +96,33 @@ func (l *Listener) Accept() (net.Conn, error) {
 
 	// TLS 1.3: extract the server and client application traffic secrets
 	var serverSecretBuf, clientSecretBuf [48]byte
+
 	serverSecret, err := parseTrafficSecret(keyBuf.String(), "SERVER_TRAFFIC_SECRET_0 ", serverSecretBuf[:])
 	if err != nil {
 		l.onError(fmt.Errorf("ktls: parse server secret: %w", err))
+
 		return tlsConn, nil
 	}
 
 	clientSecret, err := parseTrafficSecret(keyBuf.String(), "CLIENT_TRAFFIC_SECRET_0 ", clientSecretBuf[:])
 	if err != nil {
 		l.onError(fmt.Errorf("ktls: parse client secret: %w", err))
+
 		return tlsConn, nil
 	}
+
 	rxRecSeq := uint64(counter.clientAppRecords()) // apprecs - 1, the first record is the Finished
 
 	if _, err = enableKTLS(rawConn, serverSecret, clientSecret, state.CipherSuite, rxRecSeq); err != nil {
 		l.onError(err)
+
 		return tlsConn, nil
 	}
 
-	fd, _ := getRawFd(rawConn)
+	fd, err := getRawFd(rawConn)
+	if err != nil {
+		return nil, err
+	}
 
 	var ownedRxSecret []byte
 	if clientSecret != nil {

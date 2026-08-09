@@ -1,6 +1,9 @@
 package ktls
 
-import "io"
+import (
+	"errors"
+	"io"
+)
 
 // implements io.WriterTo
 // when w wraps a raw file descriptor (a TCP/unix socket, a file, a pipe)
@@ -28,10 +31,13 @@ func (c *conn) WriteToConfig(w io.Writer, cfg SpliceConfig) (int64, error) {
 // Read handles post-handshake control records (KeyUpdate), so this stays correct
 func (c *conn) genericWriteTo(w io.Writer, cfg SpliceConfig) (int64, error) {
 	buf := make([]byte, 128*1024)
+
 	var total int64
 
 	peekLeft := 0
+
 	var peek []byte
+
 	if cfg.PeekN > 0 && cfg.Peek != nil {
 		peekLeft = cfg.PeekN
 		peek = make([]byte, 0, cfg.PeekN)
@@ -41,28 +47,31 @@ func (c *conn) genericWriteTo(w io.Writer, cfg SpliceConfig) (int64, error) {
 		n, rerr := c.Read(buf)
 		if n > 0 {
 			if peekLeft > 0 {
-				take := n
-				if take > peekLeft {
-					take = peekLeft
-				}
+				take := min(n, peekLeft)
+
 				peek = append(peek, buf[:take]...)
 				if peekLeft -= take; peekLeft == 0 {
 					cfg.Peek(peek)
 				}
 			}
+
 			ww, werr := writeAll(w, buf[:n])
+
 			total += int64(ww)
 			if werr != nil {
 				return total, werr
 			}
 		}
+
 		if rerr != nil {
 			if peekLeft > 0 && len(peek) > 0 {
 				cfg.Peek(peek)
 			}
-			if rerr == io.EOF {
+
+			if errors.Is(rerr, io.EOF) {
 				return total, nil
 			}
+
 			return total, rerr
 		}
 	}
@@ -72,6 +81,7 @@ func writeAll(w io.Writer, b []byte) (int, error) {
 	written := 0
 	for written < len(b) {
 		n, err := w.Write(b[written:])
+
 		written += n
 		if err != nil {
 			return written, err
