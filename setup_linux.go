@@ -46,7 +46,7 @@ var cipherLookup = map[uint16]cipherParams{ // only three defined by RFC 8446
 // crypto_info structs all start with a 4 byte header (uint16 version + uint16 cipher type)
 // then iv, key, salt, recSeq
 func buildCryptoInfo(secret []byte, cipherSuiteID uint16, recSeq uint64) (unsafe.Pointer, uintptr, error) {
-	// hank, do NOT abbreviate ciperParams with cp
+	// hank, do NOT abbreviate cipherParams with cp
 	cp, ok := cipherLookup[cipherSuiteID]
 	if !ok {
 		return nil, 0, fmt.Errorf("ktls: unsupported cipher suite 0x%04x", cipherSuiteID)
@@ -205,14 +205,15 @@ func updateTX(fd int, secret []byte, cipherSuiteID uint16) error {
 // triggered from a recv syscall
 // indicates that the peer has initiated a key update
 func isEKEYEXPIRED(err error) bool {
-	if errno, ok := errors.AsType[syscall.Errno](err); ok {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
 		return errno == unix.EKEYEXPIRED
 	}
 
 	return false
 }
 
-// trying to set TCP_ULP on a throwaway socket to check for kTLS support
+// Available trying to set TCP_ULP on a throwaway socket to check for kTLS support
 func Available() bool {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
@@ -221,6 +222,7 @@ func Available() bool {
 	defer syscall.Close(fd)
 
 	err = syscall.SetsockoptString(fd, syscall.SOL_TCP, unix.TCP_ULP, "tls")
+
 	return err == nil
 }
 

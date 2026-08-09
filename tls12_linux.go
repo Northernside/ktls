@@ -59,6 +59,7 @@ func tls12PRF(secret []byte, label string, seed, out []byte, h func() hash.Hash)
 	labelSeed = append(labelSeed, seed...)
 
 	a := labelSeed // A(0)
+
 	for n := 0; n < len(out); {
 		am := hmac.New(h, secret)
 		am.Write(a)
@@ -92,6 +93,7 @@ func deriveTLS12KeyBlock(master, clientRandom, serverRandom []byte, p tls12Param
 	clientIV = kb[off : off+p.fixedIVLen]
 	off += p.fixedIVLen
 	serverIV = kb[off : off+p.fixedIVLen]
+
 	return
 }
 
@@ -123,28 +125,32 @@ func buildCryptoInfo12(key, fixedIV []byte, recSeq uint64, p tls12Params) (unsaf
 	}
 
 	binary.BigEndian.PutUint64(buf[off:], recSeq) // rec_seq
+
 	return unsafe.Pointer(&buf[0]), p.infoSize
 }
 
 // pulls client_random and master_secret out of the NSS-keylog
 // "CLIENT_RANDOM <client_random> <master_secret>"
 // clientRandom must be >=32, master >=48 bytes
-func parseClientRandomLine(keyLog string, clientRandom, master []byte) (crN, mN int, err error) {
+func parseClientRandomLine(keyLog string, clientRandom, master []byte) (int, int, error) {
 	const prefix = "CLIENT_RANDOM "
-	for _, line := range strings.Split(keyLog, "\n") {
+	for line := range strings.SplitSeq(keyLog, "\n") {
 		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
 
 		rest := line[len(prefix):]
+
 		sp := strings.IndexByte(rest, ' ')
 		if sp != 64 { // client_random is always 32 bytes = 64 hex chars
 			continue
 		}
+
 		cn, e := hex.Decode(clientRandom, []byte(rest[:64]))
 		if e != nil {
 			continue
 		}
+
 		mn, e := hex.Decode(master, []byte(rest[65:]))
 		if e != nil {
 			continue
@@ -158,15 +164,19 @@ func parseClientRandomLine(keyLog string, clientRandom, master []byte) (crN, mN 
 
 // installs pre-built TLS 1.2 crypto_info for both directions
 func enableKTLS12(fd int, txInfo unsafe.Pointer, txLen uintptr, rxInfo unsafe.Pointer, rxLen uintptr) error {
-	if err := syscall.SetsockoptString(fd, syscall.SOL_TCP, unix.TCP_ULP, "tls"); err != nil {
+	err := syscall.SetsockoptString(fd, syscall.SOL_TCP, unix.TCP_ULP, "tls")
+	if err != nil {
 		return fmt.Errorf("ktls: TCP_ULP: %w", err)
 	}
+
 	if _, _, errno := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), uintptr(solTLS), uintptr(tlsTX), uintptr(txInfo), txLen, 0); errno != 0 {
 		return fmt.Errorf("ktls: TLS_TX setsockopt: %w", errno)
 	}
+
 	if _, _, errno := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), uintptr(solTLS), uintptr(tlsRX), uintptr(rxInfo), rxLen, 0); errno != 0 {
 		return fmt.Errorf("ktls: TLS_RX setsockopt: %w", errno)
 	}
+
 	return nil
 }
 
@@ -180,16 +190,22 @@ func (l *Listener) setupKTLS12(rawConn net.Conn, counter *recordCounter, state t
 		return nil // non-AEAD / ChaCha20 -> userspace
 	}
 
-	var clientRandom [32]byte
-	var master [48]byte
+	var (
+		clientRandom [32]byte
+		master       [48]byte
+	)
+
 	crN, mN, err := parseClientRandomLine(keyBuf.String(), clientRandom[:], master[:])
 	if err != nil || crN != 32 || mN != 48 {
 		l.onError(fmt.Errorf("ktls12: key log: %w", err))
+
 		return nil
 	}
+
 	serverRandom, ok := counter.serverRandom()
 	if !ok {
 		l.onError(errors.New("ktls12: server_random not captured from ServerHello"))
+
 		return nil
 	}
 
@@ -201,6 +217,7 @@ func (l *Listener) setupKTLS12(rawConn net.Conn, counter *recordCounter, state t
 	if rxSeq == 0 {
 		rxSeq = 1
 	}
+
 	const txSeq = 1
 
 	txInfo, txLen := buildCryptoInfo12(serverKey, serverIV, txSeq, p)
@@ -209,10 +226,13 @@ func (l *Listener) setupKTLS12(rawConn net.Conn, counter *recordCounter, state t
 	fd, err := getRawFd(rawConn)
 	if err != nil {
 		l.onError(err)
+
 		return nil
 	}
+
 	if err := enableKTLS12(fd, txInfo, txLen, rxInfo, rxLen); err != nil {
 		l.onError(err)
+
 		return nil
 	}
 

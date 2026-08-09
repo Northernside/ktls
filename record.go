@@ -40,22 +40,6 @@ func (rc *recordCounter) Write(b []byte) (int, error) {
 	return rc.Conn.Write(b)
 }
 
-// returns the 32-byte server_random from the captured ServerHello
-// record header(5) + handshake header(4) + legacy_version(2) then random(32)
-func (rc *recordCounter) serverRandom() ([]byte, bool) {
-	if len(rc.outHead) < 43 || rc.outHead[0] != 0x16 || rc.outHead[5] != 0x02 {
-		return nil, false
-	}
-
-	return rc.outHead[11:43], true
-}
-
-// the number of records the client sent under the new cipher (after its ChangeCipherSpec)
-// equals the RX sequence number for kTLS 1.2
-func (rc *recordCounter) postCCSCount() int {
-	return rc.postCCS
-}
-
 // forwards to the wrapped conn, required because the userspace fallback returns
 // a *tls.Conn built on the recordCounter (not the raw socket) and callers unwrap
 // *tls.Conn via NetConn() then expect syscall.Conn to reach the fd
@@ -88,6 +72,22 @@ func (rc *recordCounter) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// returns the 32-byte server_random from the captured ServerHello
+// record header(5) + handshake header(4) + legacy_version(2) then random(32)
+func (rc *recordCounter) serverRandom() ([]byte, bool) {
+	if len(rc.outHead) < 43 || rc.outHead[0] != 0x16 || rc.outHead[5] != 0x02 {
+		return nil, false
+	}
+
+	return rc.outHead[11:43], true
+}
+
+// the number of records the client sent under the new cipher (after its ChangeCipherSpec)
+// equals the RX sequence number for kTLS 1.2
+func (rc *recordCounter) postCCSCount() int {
+	return rc.postCCS
+}
+
 // returns how many bytes are left in the record currently being read
 // the rest of the 5-byte header, or the rest of the body once known
 func (rc *recordCounter) recordRemaining() int {
@@ -108,6 +108,7 @@ func (rc *recordCounter) parse(data []byte) {
 				copy(rc.headerBuf[rc.headerN:], data)
 				rc.headerN += len(data)
 				rc.partial = true
+
 				return
 			}
 
@@ -123,6 +124,7 @@ func (rc *recordCounter) parse(data []byte) {
 				rc.onFullRecord(rc.headerBuf[0])
 				rc.inBody = false
 				rc.partial = false
+
 				continue
 			}
 		}
@@ -131,6 +133,7 @@ func (rc *recordCounter) parse(data []byte) {
 		if len(data) < rc.bodyRem {
 			rc.bodyRem -= len(data)
 			rc.partial = true
+
 			return
 		}
 
@@ -169,5 +172,6 @@ func (rc *recordCounter) clientAppRecords() int {
 	if n < 0 {
 		return 0
 	}
+
 	return n
 }

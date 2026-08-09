@@ -36,10 +36,13 @@ func (c *conn) ReadFromConfig(r io.Reader, cfg SpliceConfig) (int64, error) {
 // all output goes through Write, so there is no splice/Write mix
 func (c *conn) genericReadFrom(r io.Reader, cfg SpliceConfig) (int64, error) {
 	buf := make([]byte, 128*1024)
+
 	var total int64
 
 	peekLeft := 0
+
 	var peek []byte
+
 	if cfg.PeekN > 0 && cfg.Peek != nil {
 		peekLeft = cfg.PeekN
 		peek = make([]byte, 0, cfg.PeekN)
@@ -49,28 +52,31 @@ func (c *conn) genericReadFrom(r io.Reader, cfg SpliceConfig) (int64, error) {
 		n, rerr := r.Read(buf)
 		if n > 0 {
 			if peekLeft > 0 {
-				take := n
-				if take > peekLeft {
-					take = peekLeft
-				}
+				take := min(n, peekLeft)
+
 				peek = append(peek, buf[:take]...)
 				if peekLeft -= take; peekLeft == 0 {
 					cfg.Peek(peek)
 				}
 			}
-			w, werr := c.Write(buf[:n])
+
+			w, werr := writeAll(c, buf[:n])
+
 			total += int64(w)
 			if werr != nil {
 				return total, werr
 			}
 		}
+
 		if rerr != nil {
 			if peekLeft > 0 && len(peek) > 0 { // stream ended before filling the window
 				cfg.Peek(peek)
 			}
+
 			if rerr == io.EOF {
 				return total, nil
 			}
+
 			return total, rerr
 		}
 	}

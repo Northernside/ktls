@@ -33,7 +33,8 @@ func isPostHandshakeSignal(err error) bool {
 }
 
 func isErrno(err error, want syscall.Errno) bool {
-	if errno, ok := errors.AsType[syscall.Errno](err); ok {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
 		return errno == want
 	}
 
@@ -80,7 +81,8 @@ func (c *conn) onPostHandshakeMsg(msg []byte) error {
 		return nil
 	}
 
-	if err := c.rekeyRX(); err != nil {
+	err := c.rekeyRX()
+	if err != nil {
 		return err
 	}
 
@@ -116,11 +118,13 @@ func (c *conn) sendKeyUpdateAndRekeyTX() error {
 	if err != nil {
 		return err
 	}
+
 	if err := updateTX(c.fd, next, c.cipherSuiteID); err != nil {
 		return err
 	}
 
 	c.txSecret = next
+
 	return nil
 }
 
@@ -132,16 +136,20 @@ func (c *conn) sendControlRecord(recordType byte, payload []byte) error {
 	if err != nil {
 		return err
 	}
+
 	oob := recordTypeCmsg(recordType)
 
 	var serr error
+
 	ctlErr := sc.Write(func(fd uintptr) bool {
 		serr = syscall.Sendmsg(int(fd), payload, oob, nil, 0)
+
 		return serr != syscall.EAGAIN
 	})
 	if ctlErr != nil {
 		return ctlErr
 	}
+
 	return serr
 }
 
@@ -154,6 +162,7 @@ func recordTypeCmsg(recordType byte) []byte {
 	h.Type = tlsSetRecordType
 	h.SetLen(syscall.CmsgLen(1))
 	buf[syscall.CmsgLen(0)] = recordType
+
 	return buf
 }
 
@@ -169,20 +178,26 @@ func (c *conn) recvControlRecord() (recordType byte, payload []byte, err error) 
 	buf := make([]byte, 512)
 	oob := make([]byte, 128)
 
-	var n, oobn int
-	var rerr error
+	var (
+		n, oobn int
+		rerr    error
+	)
+
 	ctlErr := sc.Read(func(fd uintptr) bool {
 		n, oobn, _, _, rerr = syscall.Recvmsg(int(fd), buf, oob, 0)
+
 		return rerr != syscall.EAGAIN // false -> let the poller wait for readability
 	})
 	if ctlErr != nil {
 		return 0, nil, ctlErr
 	}
+
 	if rerr != nil {
 		return 0, nil, rerr
 	}
 
 	recordType = recordApplicationData
+
 	if oobn > 0 {
 		cmsgs, perr := syscall.ParseSocketControlMessage(oob[:oobn])
 		if perr == nil {

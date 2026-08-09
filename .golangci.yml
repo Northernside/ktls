@@ -1,0 +1,125 @@
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+  settings:
+    gofumpt:
+      extra-rules: true
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+linters:
+  enable:
+    - gomodguard_v2
+  default: all
+  disable:
+    # -- temporary disabled todo: enable later --
+    - noinlineerr
+    - errcheck
+    - noctx
+    - nonamedreturns
+    - unparam
+    - govet
+    - forcetypeassert
+    - gosec
+    # -- temporary disabled --
+    - thelper
+    - goconst
+    - gomodguard
+    - cyclop
+    - depguard
+    - dupword
+    - exhaustruct
+    - funlen
+    - gochecknoglobals
+    - gocognit
+    - gocyclo
+    - godox
+    - lll
+    - mnd
+    - nestif
+    - rowserrcheck
+    - varnamelen
+    - wsl
+    - wrapcheck
+    - revive
+    - err113
+    - dupl
+    - paralleltest
+    - nolintlint
+    - godot
+    - interfacebloat
+    - ireturn
+    - containedctx
+    - testpackage
+    - tagalign
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+    presets:
+      - common-false-positives
+      - legacy
+  settings:
+    revive:
+      confidence: 0.8
+      rules:
+        - name: exported
+          arguments: [ ]
+        - name: var-naming
+          arguments:
+            - ID
+            - [ ]
+        - name: package-comments
+        - name: dot-imports
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: receiver-naming
+        - name: range
+        - name: time-naming
+        - name: unexported-return
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: if-return
+    errcheck:
+      check-blank: true
+      check-type-assertions: true
+    wrapcheck:
+      ignore-sigs:
+        - ".Errorf("
+        - errors.New(
+        - errors.Unwrap(
+        - errors.Join(
+        - ".Wrap("
+        - ".Wrapf("
+        - ".WithMessage("
+        - ".WithMessagef("
+        - ".WithStack("
+    err113:
+      check-type-assertion: true
+    misspell:
+      locale: US
+    govet:
+      enable:
+        - shadow
+    dupl:
+      threshold: 150
+run:
+  concurrency: 4
+  issues-exit-code: 1
+  tests: true
+version: 2

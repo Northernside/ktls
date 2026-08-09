@@ -16,8 +16,10 @@ func TestRecordCounterSyscallConn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer ln.Close()
 	go func() { c, _ := net.Dial("tcp", ln.Addr().String()); _ = c; select {} }()
+
 	raw, err := ln.Accept()
 	if err != nil {
 		t.Fatal(err)
@@ -30,16 +32,21 @@ func TestRecordCounterSyscallConn(t *testing.T) {
 	// mimics getRawFd
 	// unwrap *tls.Conn -> NetConn() -> syscall.Conn -> fd
 	nc := tc.NetConn()
+
 	sc, ok := nc.(syscall.Conn)
 	if !ok {
 		t.Fatalf("NetConn() %T does not implement syscall.Conn", nc)
 	}
+
 	rc, err := sc.SyscallConn()
 	if err != nil {
 		t.Fatalf("SyscallConn: %v", err)
 	}
+
 	fd := -1
+
 	rc.Control(func(f uintptr) { fd = int(f) })
+
 	if fd <= 0 {
 		t.Fatalf("got fd=%d, want >0", fd)
 	}
